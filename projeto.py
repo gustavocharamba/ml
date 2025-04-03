@@ -1,125 +1,160 @@
 import os
 import numpy as np
 import cv2
-from tqdm import tqdm
+import matplotlib.pyplot as plt
+from sklearn.model_selection import KFold
 
-def carregar_imagens(caminho_base, tamanho=(512, 512)):
-    categorias = ['tubarao', 'mar', 'naoSei']
-    dados = []
+
+def carregar_imagens(tamanho=(256, 256)):
+    classes = ['tubarao', 'mar', 'naoSei']
+    imagens = []
     rotulos = []
 
-    for idx, categoria in enumerate(categorias):
-        caminho = os.path.join(caminho_base, categoria)
-        if not os.path.exists(caminho):
-            print(f"Aviso: Pasta {caminho} não encontrada.")
+    for idx, classe in enumerate(classes):
+        pasta_classe = classe
+        if not os.path.exists(pasta_classe):
+            print(f"Aviso: A pasta {pasta_classe} não existe. Pulando.")
             continue
 
-        arquivos = os.listdir(caminho)
-        for arquivo in arquivos:
-            img_path = os.path.join(caminho, arquivo)
-            img = cv2.imread(img_path)
-            if img is None:
-                print(f"Erro ao carregar: {img_path}")
-                continue
-            img = cv2.resize(img, tamanho)  # Garantindo tamanho correto
-            img = img / 255.0  # Normalizando
-            dados.append(img.flatten())  # Convertendo para vetor
-            rotulos.append(idx)
+        for arquivo in os.listdir(pasta_classe):
+            if arquivo.endswith(('.png', '.jpg', '.jpeg')):
+                caminho_arquivo = os.path.join(pasta_classe, arquivo)
+                try:
+                    img = cv2.imread(caminho_arquivo, cv2.IMREAD_GRAYSCALE)
+                    if img.shape[0] != tamanho[0] or img.shape[1] != tamanho[1]:
+                        img = cv2.resize(img, tamanho)
+                    img_normalizada = img.astype(np.float32) / 255.0
+                    img_achatada = img_normalizada.flatten()
+                    imagens.append(img_achatada)
+                    rotulos.append(idx)
+                except Exception as e:
+                    print(f"Erro ao processar {arquivo}: {str(e)}")
+    return np.array(imagens), np.array(rotulos)
 
-    dados = np.array(dados)
-    rotulos = np.array(rotulos)
-    return dados, rotulos
 
-def sigmoid(x):
-    return 1 / (1 + np.exp(-x))
+# Classe da Rede Neural
+class RedeNeural:
+    def __init__(self, tamanho_entrada, tamanho_oculta, tamanho_saida, regularizacao='L2', lambda_reg=0.01,
+                 dropout_rate=0.2):
+        self.W1 = np.random.randn(tamanho_entrada, tamanho_oculta) * np.sqrt(2.0 / tamanho_entrada)
+        self.b1 = np.zeros((1, tamanho_oculta))
+        self.W2 = np.random.randn(tamanho_oculta, tamanho_saida) * np.sqrt(2.0 / tamanho_oculta)
+        self.b2 = np.zeros((1, tamanho_saida))
+        self.regularizacao = regularizacao
+        self.lambda_reg = lambda_reg
+        self.dropout_rate = dropout_rate
+        self.dropout_mask = None
 
-def sigmoid_deriv(x):
-    return x * (1 - x)
+    def relu(self, Z):
+        return np.maximum(0, Z)
 
-def softmax(x):
-    exp_x = np.exp(x - np.max(x, axis=1, keepdims=True))
-    return exp_x / np.sum(exp_x, axis=1, keepdims=True)
+    def softmax(self, Z):
+        exp_Z = np.exp(Z - np.max(Z, axis=1, keepdims=True))
+        return exp_Z / np.sum(exp_Z, axis=1, keepdims=True)
 
-def reg_l2(w, lamb_l2):
-    return lamb_l2 * w
+    def forward(self, X, training=False):
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        self.Z1 = np.dot(X, self.W1) + self.b1
+        self.A1 = self.relu(self.Z1)
 
-def pesos(entrada, escondida, saida):
-    escondida = int(escondida)
-    saida = int(saida)  # Add this line to convert saida to int
-    w1 = np.random.randn(entrada, escondida) * np.sqrt(2.0 / (entrada + escondida))
-    b1 = np.zeros((1, escondida))
-    w2 = np.random.randn(escondida, saida) * np.sqrt(2.0 / (escondida + saida))
-    b2 = np.zeros((1, saida))
-    return w1, b1, w2, b2
+        if training:
+            self.dropout_mask = (np.random.rand(*self.A1.shape) > self.dropout_rate) / (1 - self.dropout_rate)
+            self.A1 *= self.dropout_mask
 
-def forward(x, w1, b1, w2, b2):
-    z1 = np.dot(x, w1) + b1
-    a1 = sigmoid(z1)
-    z2 = np.dot(a1, w2) + b2
-    saida = softmax(z2)
-    return saida, a1, z1, z2
+        self.Z2 = np.dot(self.A1, self.W2) + self.b2
+        self.A2 = self.softmax(self.Z2)
+        return self.A2
 
-def backward(x, y, saida, a1, z1, w1, b1, w2, b2, lamb_l2):
-    m = x.shape[0]
-    erro_saida = saida - y
-    dw2 = np.dot(a1.T, erro_saida) / m + reg_l2(w2, lamb_l2)
-    db2 = np.sum(erro_saida, axis=0, keepdims=True) / m
-    erro_escondida = np.dot(erro_saida, w2.T) * sigmoid_deriv(a1)
-    dw1 = np.dot(x.T, erro_escondida) / m + reg_l2(w1, lamb_l2)
-    db1 = np.sum(erro_escondida, axis=0, keepdims=True) / m
-    return dw1, db1, dw2, db2
+    def backward(self, X, Y, learning_rate):
+        m = X.shape[0]
+        dZ2 = self.A2 - Y
+        dW2 = (1 / m) * np.dot(self.A1.T, dZ2)
+        db2 = (1 / m) * np.sum(dZ2, axis=0, keepdims=True)
 
-def treinamento(x, y, epocas=10, taxa=0.01, k_folds=5, lamb_l2=0.01):
-    y_onehot = np.zeros((y.shape[0], len(np.unique(y))))
-    for i, classe in enumerate(np.unique(y)):
-        y_onehot[:, i] = (y == classe).astype(int)
+        if self.regularizacao == 'L2':
+            dW2 += (self.lambda_reg / m) * self.W2
 
-    entrada = x.shape[1]
-    escondida = 15
-    saida = y_onehot.shape[1]  # Corrigido para o número de classes
+        dZ1 = np.dot(dZ2, self.W2.T) * (self.Z1 > 0)
+        if self.dropout_mask is not None:
+            dZ1 *= self.dropout_mask
 
-    indices = np.arange(x.shape[0])
-    np.random.shuffle(indices)
-    tamanho = len(indices) // k_folds
+        dW1 = (1 / m) * np.dot(X.T, dZ1)
+        db1 = (1 / m) * np.sum(dZ1, axis=0, keepdims=True)
 
-    acuracias = []
-    for j in range(k_folds):
-        inicio, fim = j * tamanho, (j + 1) * tamanho
-        indice_valid = indices[inicio:fim]
-        indices_treino = np.concatenate([indices[:inicio], indices[fim:]])
-        x_treino, y_treino = x[indices_treino], y_onehot[indices_treino]
-        x_valid, y_valid = x[indice_valid], y_onehot[indice_valid]
+        if self.regularizacao == 'L2':
+            dW1 += (self.lambda_reg / m) * self.W1
 
-        w1, b1, w2, b2 = pesos(entrada, escondida, saida)
+        self.W2 -= learning_rate * dW2
+        self.b2 -= learning_rate * db2
+        self.W1 -= learning_rate * dW1
+        self.b1 -= learning_rate * db1
 
-        for epoca in tqdm(range(epocas), desc="Treinando", unit="época"):
-            permut = np.random.permutation(len(x_treino))
-            x_shuffle, y_shuffle = x_treino[permut], y_treino[permut]
-            batch = 32
+    def predict(self, X):
+        return np.argmax(self.forward(X, training=False), axis=1)
 
-            for i in range(0, len(x_shuffle), batch):
-                x_batch, y_batch = x_shuffle[i:i + batch], y_shuffle[i:i + batch]
-                saida, a1, z1, z2 = forward(x_batch, w1, b1, w2, b2)
-                dw1, db1, dw2, db2 = backward(x_batch, y_batch, saida, a1, z1, w1, b1, w2, b2, lamb_l2)
-                w1 -= taxa * dw1
-                b1 -= taxa * db1
-                w2 -= taxa * dw2
-                b2 -= taxa * db2
+    def train(self, X, Y, epochs=50, batch_size=16, learning_rate=0.0001, k_folds=5):
+        kf = KFold(n_splits=k_folds, shuffle=True)
+        acc_scores = []
 
-        saida_valid, _, _, _ = forward(x_valid, w1, b1, w2, b2)
-        acuracia = np.mean(np.argmax(saida_valid, axis=1) == np.argmax(y_valid, axis=1))
-        acuracias.append(acuracia)
+        for train_idx, val_idx in kf.split(X):
+            X_train, X_val = X[train_idx], X[val_idx]
+            Y_train, Y_val = Y[train_idx], Y[val_idx]
 
-    media = np.mean(acuracias)
-    desvio = np.std(acuracias)
-    print(f"Acurácia média: {media:.4f}")
-    print(f"Desvio padrão: {desvio:.4f}")
-    return media, desvio
+            for epoch in range(epochs):
+                indices = np.random.permutation(X_train.shape[0])
+                X_train = X_train[indices]
+                Y_train = Y_train[indices]
 
-# Exemplo de uso:
-caminho_base = ""  # Substitua com o caminho correto
-x, y = carregar_imagens(caminho_base)
-print(f"Total de amostras carregadas: {len(y)}")
+                for i in range(0, X_train.shape[0], batch_size):
+                    X_batch = X_train[i:i + batch_size]
+                    Y_batch = np.eye(3)[Y_train[i:i + batch_size]]
+                    self.forward(X_batch, training=True)
+                    self.backward(X_batch, Y_batch, learning_rate)
 
-# Executando o treinamento e calculando a acurácia
-media_acuracia, desvio_acuracia = treinamento(x, y)
+            Y_pred = self.predict(X_val)
+            acc = np.mean(Y_pred == Y_val)
+            acc_scores.append(acc)
+
+        print(f"Acurácia média: {np.mean(acc_scores):.4f}, Desvio padrão: {np.std(acc_scores):.4f}")
+
+
+# Função para processar imagem e gerar mapa de calor
+def processar_imagem(entrada, saida, modelo):
+    imagem = cv2.imread(entrada)
+    altura, largura = imagem.shape[:2]
+    imagem_cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+    mapa_probabilidade = np.zeros((altura, largura), dtype=np.float32)
+
+    janela_tamanho = 64
+    passo = 32
+
+    for y in range(0, altura - janela_tamanho + 1, passo):
+        for x in range(0, largura - janela_tamanho + 1, passo):
+            roi = imagem_cinza[y:y + janela_tamanho, x:x + janela_tamanho]
+            roi_resized = cv2.resize(roi, (256, 256))
+            roi_norm = roi_resized.astype(np.float32) / 255.0
+            roi_flat = roi_norm.flatten()
+            predicao = modelo.forward(roi_flat, training=False)
+            probabilidade_tubarao = predicao[0][0]
+            mapa_probabilidade[y:y + janela_tamanho, x:x + janela_tamanho] += probabilidade_tubarao
+
+    if np.max(mapa_probabilidade) > 0:
+        mapa_probabilidade = mapa_probabilidade / np.max(mapa_probabilidade)
+
+    mapa_calor_normalizado = (mapa_probabilidade * 255).astype(np.uint8)
+    mapa_calor_colorido = cv2.applyColorMap(mapa_calor_normalizado, cv2.COLORMAP_JET)
+    alpha = 0.6
+    imagem_com_mapa = cv2.addWeighted(imagem, 1 - alpha, mapa_calor_colorido, alpha, 0)
+
+    cv2.imwrite(saida, imagem_com_mapa)
+    print(f"Imagem processada salva em: {saida}")
+
+
+if __name__ == "__main__":
+    X, Y = carregar_imagens()
+    modelo = RedeNeural(tamanho_entrada=256 * 256, tamanho_oculta=256, tamanho_saida=3)
+    modelo.train(X, Y)
+
+    # Processar uma imagem específica após o treinamento
+    processar_imagem("frame_0134.png", "saida.png", modelo)
